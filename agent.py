@@ -20,7 +20,7 @@ Usage (once implemented):
 
 import re
 
-from tools import search_listings, suggest_outfit, create_fit_card
+from tools import search_listings, suggest_outfit, create_fit_card, estimate_savings
 
 
 # ── query parsing ─────────────────────────────────────────────────────────────
@@ -61,6 +61,57 @@ def _parse_query(query: str) -> dict:
     return {"description": description, "size": size, "max_price": max_price}
 
 
+# ── search with retry ────────────────────────────────────────────────────────
+
+def _search_with_retries(parsed: dict) -> tuple[list[dict], str | None]:
+    """
+    Run search_listings with the parsed parameters. If that returns nothing,
+    retry with progressively looser constraints until one attempt succeeds
+    or all attempts are exhausted.
+
+    Retry order (each only tried if applicable):
+        1. Drop size (if size was set).
+        2. Raise the price ceiling 50% (if max_price was set).
+        3. Drop size AND raise the price ceiling 50% (if both were set and
+           attempts 1-2 were still empty).
+
+    Returns:
+        (results, relaxed) — `relaxed` is None if the original search
+        succeeded, otherwise a short string describing what was loosened
+        for the attempt that finally returned results. If every attempt is
+        empty, returns ([], None).
+    """
+    description = parsed["description"]
+    size = parsed["size"]
+    max_price = parsed["max_price"]
+
+    results = search_listings(description, size, max_price)
+    if results:
+        return results, None
+
+    attempts: list[tuple[str | None, float | None, str]] = []
+    if size is not None:
+        attempts.append((None, max_price, "dropped your size filter"))
+    if max_price is not None:
+        raised_price = max_price * 1.5
+        attempts.append(
+            (size, raised_price, f"raised your price ceiling to ~${raised_price:.0f}")
+        )
+        if size is not None:
+            attempts.append((
+                None,
+                raised_price,
+                f"dropped your size filter and raised your price ceiling to ~${raised_price:.0f}",
+            ))
+
+    for try_size, try_price, note in attempts:
+        results = search_listings(description, try_size, try_price)
+        if results:
+            return results, note
+
+    return [], None
+
+
 # ── session state ─────────────────────────────────────────────────────────────
 
 def _new_session(query: str, wardrobe: dict) -> dict:
@@ -77,8 +128,10 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "query": query,              # original user query
         "parsed": {},                # extracted description / size / max_price
         "search_results": [],        # list of matching listing dicts
+        "relaxed": None,             # set if a retry with looser constraints succeeded
         "selected_item": None,       # top result, passed into suggest_outfit
         "wardrobe": wardrobe,        # user's wardrobe dict
+        "savings": None,             # dict returned by estimate_savings
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
         "error": None,               # set if the interaction ended early
@@ -103,34 +156,34 @@ def run_agent(query: str, wardrobe: dict) -> dict:
         first — if it is not None, the interaction ended early and the other
         output fields (outfit_suggestion, fit_card) will be None.
 
-    TODO — implement this function using the planning loop you designed in planning.md:
+    Planning loop (see planning.md for the full spec):
 
         Step 1: Initialize the session with _new_session().
 
-        Step 2: Parse the user's query to extract a description, size, and
-                max_price. You can use regex, string splitting, or ask the LLM
-                to parse it — document your choice in planning.md.
-                Store the result in session["parsed"].
+        Step 2: Parse the query into description / size / max_price with
+                _parse_query(). Store the result in session["parsed"].
 
-        Step 3: Call search_listings() with the parsed parameters.
-                Store results in session["search_results"].
-                If no results: set session["error"] to a helpful message and
-                return the session early. Do NOT proceed to suggest_outfit
-                with empty input.
+        Step 3: Call _search_with_retries(), which runs search_listings() and,
+                if that returns nothing, retries with progressively looser
+                constraints (drop size, raise price 50%, both). Stores
+                session["search_results"] and session["relaxed"] (a note on
+                what was loosened, or None). If every attempt is empty, set
+                session["error"] and return early — suggest_outfit and
+                create_fit_card are NOT called with empty input.
 
-        Step 4: Select the item to use (e.g., the top result).
-                Store it in session["selected_item"].
+        Step 4: Select the item to use (the top result). Store it in
+                session["selected_item"].
 
-        Step 5: Call suggest_outfit() with the selected item and wardrobe.
+        Step 5: Call estimate_savings() with the selected item.
+                Store the result in session["savings"].
+
+        Step 6: Call suggest_outfit() with the selected item and wardrobe.
                 Store the result in session["outfit_suggestion"].
 
-        Step 6: Call create_fit_card() with the outfit suggestion and selected item.
-                Store the result in session["fit_card"].
+        Step 7: Call create_fit_card() with the outfit suggestion, selected
+                item, and savings. Store the result in session["fit_card"].
 
-        Step 7: Return the session.
-
-    Before writing code, complete the Planning Loop and State Management sections
-    of planning.md — your implementation should match what you described there.
+        Step 8: Return the session.
     """
     # Step 1: fresh session — single source of truth for this interaction.
     session = _new_session(query, wardrobe)
@@ -139,13 +192,11 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     session["parsed"] = _parse_query(query)
     parsed = session["parsed"]
 
-    # Step 3: search.
-    session["search_results"] = search_listings(
-        parsed["description"], parsed["size"], parsed["max_price"]
-    )
+    # Step 3: search, retrying with looser constraints if the original is empty.
+    session["search_results"], session["relaxed"] = _search_with_retries(parsed)
 
-    # Step 3 (branch): no results → set a helpful error and return early.
-    # The styling tools are NOT called with empty input.
+    # Step 3 (branch): no results from any attempt → set a helpful error and
+    # return early. The styling tools are NOT called with empty input.
     if not session["search_results"]:
         bits = [f"'{parsed['description']}'"]
         if parsed["size"]:
@@ -161,17 +212,20 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     # Step 4: select the top (most relevant) result.
     session["selected_item"] = session["search_results"][0]
 
-    # Step 5: suggest an outfit using the selected item + the user's wardrobe.
+    # Step 5: estimate how much the item saves vs. buying it new.
+    session["savings"] = estimate_savings(session["selected_item"])
+
+    # Step 6: suggest an outfit using the selected item + the user's wardrobe.
     session["outfit_suggestion"] = suggest_outfit(
         session["selected_item"], session["wardrobe"]
     )
 
-    # Step 6: turn the outfit into a shareable fit card.
+    # Step 7: turn the outfit into a shareable fit card.
     session["fit_card"] = create_fit_card(
-        session["outfit_suggestion"], session["selected_item"]
+        session["outfit_suggestion"], session["selected_item"], session["savings"]
     )
 
-    # Step 7: return the completed session.
+    # Step 8: return the completed session.
     return session
 
 

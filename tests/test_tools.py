@@ -14,7 +14,7 @@ import os
 
 import pytest
 
-from tools import search_listings, suggest_outfit, create_fit_card
+from tools import search_listings, suggest_outfit, create_fit_card, estimate_savings
 from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
 
 
@@ -58,6 +58,30 @@ def test_fit_card_whitespace_outfit_returns_error_string():
     result = create_fit_card("   ", item)
     assert isinstance(result, str)
     assert result == "Can't write a fit card without an outfit suggestion."
+
+
+# ── estimate_savings ──────────────────────────────────────────────────────────
+
+def test_estimate_savings_returns_expected_shape():
+    item = search_listings("vintage graphic tee", size=None, max_price=50)[0]
+    result = estimate_savings(item)
+
+    assert isinstance(result, dict)
+    assert set(result.keys()) == {"estimated_retail", "savings_amount", "savings_pct"}
+    assert result["estimated_retail"] > 0
+    assert result["savings_amount"] >= 0
+    assert 0 <= result["savings_pct"] <= 100
+
+
+def test_estimate_savings_falls_back_without_api_key(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+
+    item = search_listings("vintage graphic tee", size=None, max_price=50)[0]
+    result = estimate_savings(item)
+
+    assert result["estimated_retail"] == item["price"] * 2.5
+    assert result["savings_amount"] == item["price"] * 1.5
+    assert result["savings_pct"] == 60
 
 
 # ── live LLM tests (skipped without an API key) ──────────────────────────────

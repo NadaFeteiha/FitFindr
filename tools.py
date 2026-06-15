@@ -1,15 +1,16 @@
 """
 tools.py
 
-The three required FitFindr tools. Each tool is a standalone function that
-can be called and tested independently before being wired into the agent loop.
+The FitFindr tools. Each tool is a standalone function that can be called
+and tested independently before being wired into the agent loop.
 
 Complete and test each tool before moving to agent.py.
 
 Tools:
     search_listings(description, size, max_price)  → list[dict]
     suggest_outfit(new_item, wardrobe)              → str
-    create_fit_card(outfit, new_item)               → str
+    create_fit_card(outfit, new_item, savings)      → str
+    estimate_savings(item)                          → dict
 """
 
 import os
@@ -191,13 +192,15 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
 
-def create_fit_card(outfit: str, new_item: dict) -> str:
+def create_fit_card(outfit: str, new_item: dict, savings: dict | None = None) -> str:
     """
     Generate a short, shareable outfit caption for the thrifted find.
 
     Args:
         outfit:   The outfit suggestion string from suggest_outfit().
         new_item: The listing dict for the thrifted item.
+        savings:  Optional dict from estimate_savings() — if provided and
+                  savings_amount > 0, the caption may mention the deal.
 
     Returns:
         A 2–4 sentence string usable as an Instagram/TikTok caption.
@@ -209,14 +212,6 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
     - Mention the item name, price, and platform naturally (once each)
     - Capture the outfit vibe in specific terms
     - Sound different each time for different inputs (use higher LLM temperature)
-
-    TODO:
-        1. Guard against an empty or whitespace-only outfit string.
-        2. Build a prompt that gives the LLM the item details and the outfit,
-           and asks for a caption matching the style guidelines above.
-        3. Call the LLM and return the response.
-
-    Before writing code, fill in the Tool 3 section of planning.md.
     """
     # Guard: no outfit → descriptive error string, no LLM call, no exception.
     if not outfit or not outfit.strip():
@@ -227,14 +222,24 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
     platform = new_item.get("platform", "a resale app")
     price_str = f"${price:.0f}" if isinstance(price, (int, float)) else "a steal"
 
+    savings_line = ""
+    if savings and savings.get("savings_amount", 0) > 0:
+        savings_line = (
+            f"\nEstimated retail price: ~${savings['estimated_retail']:.0f} "
+            f"(saved ~${savings['savings_amount']:.0f}, about {savings['savings_pct']}% off)\n"
+        )
+
     prompt = (
         "Write a short, casual social-media caption (2-4 sentences) for a thrifted outfit. "
         "It should read like a real OOTD/Instagram caption, NOT a product description.\n\n"
         f"Item: {title}\nPrice: {price_str}\nBought on: {platform}\n"
-        f"How it's styled: {outfit}\n\n"
+        f"How it's styled: {outfit}\n"
+        f"{savings_line}\n"
         "Mention the item name, the price, and the platform naturally — once each. "
         "Capture the vibe in specific terms. Lowercase, a little playful, an emoji or two is fine. "
-        "Return only the caption."
+        + ("If a savings/deal line is given above, weave it in naturally (e.g. 'for way less than retail'). "
+           if savings_line else "")
+        + "Return only the caption."
     )
 
     try:
@@ -245,3 +250,62 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
             f"thrifted {title} on {platform} for {price_str} and i'm obsessed — "
             "styled it exactly how i hoped ✨ (caption generator hiccuped, but the fit's real)"
         )
+
+
+# ── Tool 4: estimate_savings ──────────────────────────────────────────────────
+
+def estimate_savings(item: dict) -> dict:
+    """
+    Estimate the typical retail (new) price for an item and compute how much
+    the user saves by buying it secondhand at its listed price.
+
+    Args:
+        item: A listing dict (the selected item) — uses title, brand,
+              category, and price.
+
+    Returns:
+        A dict:
+            {
+                "estimated_retail": float,
+                "savings_amount": float,  # estimated_retail - price, floored at 0
+                "savings_pct": int,       # round(savings_amount / estimated_retail * 100)
+            }
+        Never raises. If the LLM call fails or its response can't be parsed
+        into a usable number, falls back to a heuristic estimate
+        (estimated_retail = price * 2.5).
+    """
+    price = item.get("price") or 0.0
+    title = item.get("title", "this item")
+    brand = item.get("brand") or "a generic/unbranded version"
+    category = item.get("category", "clothing")
+
+    prompt = (
+        f"Estimate the typical retail price in USD for this item brand new, full price: "
+        f"\"{title}\" (category: {category}, brand: {brand}).\n"
+        "Respond with ONLY a number — no dollar sign, no words, no range."
+    )
+
+    estimated_retail = None
+    try:
+        response = _chat(prompt, temperature=0.3)
+        match = re.search(r"\d+(?:\.\d+)?", response)
+        if match:
+            candidate = float(match.group(0))
+            if candidate > price:
+                estimated_retail = candidate
+    except Exception:
+        pass
+
+    if estimated_retail is None:
+        estimated_retail = price * 2.5
+
+    savings_amount = max(0.0, estimated_retail - price)
+    savings_pct = (
+        round(savings_amount / estimated_retail * 100) if estimated_retail > 0 else 0
+    )
+
+    return {
+        "estimated_retail": estimated_retail,
+        "savings_amount": savings_amount,
+        "savings_pct": savings_pct,
+    }

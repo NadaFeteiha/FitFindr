@@ -88,7 +88,29 @@ outfit vibe, and reads like a real social caption — varying run-to-run because
 
 ### Additional Tools (if any)
 
-None for the base submission. (Stretch candidate: `compare_price(item)` — see Stretch section before starting.)
+### Tool 4: estimate_savings (stretch)
+
+**What it does:**
+Uses the LLM to estimate the typical retail (new) price for an item like `new_item`, then computes how
+much the user saves by buying it secondhand at its listed price.
+
+**Input parameters:**
+- `item` (dict): A listing dict (the selected item), used for its title, brand, category, and price.
+
+**What it returns:**
+A `dict`:
+```python
+{
+    "estimated_retail": float,
+    "savings_amount": float,   # estimated_retail - item["price"], floored at 0
+    "savings_pct": int,        # round(savings_amount / estimated_retail * 100), floored at 0
+}
+```
+
+**What happens if it fails or returns nothing:**
+LLM/network error or unparsable response → falls back to a heuristic estimate
+(`estimated_retail = item["price"] * 2.5`) and computes the same dict from that — never raises, never
+returns `None`.
 
 ---
 
@@ -105,16 +127,31 @@ changes based on what each tool returns — it is NOT a fixed "always call all t
    - `description`: the query with the matched price/size phrases stripped out.
    Store in `session["parsed"]`.
 2. **Search.** Call `search_listings(description, size, max_price)`; store in `session["search_results"]`.
-3. **Branch on the result (this is the decision point):**
-   - **If `search_results` is empty** → set `session["error"]` to a message naming what to loosen,
-     leave `outfit_suggestion`/`fit_card` as `None`, and **return early**. suggest_outfit is never called.
-   - **If `search_results` is non-empty** → set `session["selected_item"] = search_results[0]` and continue.
-4. **Suggest.** Call `suggest_outfit(selected_item, wardrobe)`; store in `session["outfit_suggestion"]`.
-5. **Fit card.** Call `create_fit_card(outfit_suggestion, selected_item)`; store in `session["fit_card"]`.
-6. **Return** the completed session.
+3. **Branch on the result (this is the decision point) — with retry-on-empty (stretch):**
+   - **If `search_results` is non-empty** → set `session["selected_item"] = search_results[0]`,
+     `session["relaxed"] = None`, and continue.
+   - **If `search_results` is empty** → retry with progressively looser constraints, in this fixed
+     order, stopping at the first attempt that returns non-empty results:
+     1. *(only if `size` was set)* drop size: `search_listings(description, None, max_price)`.
+     2. *(only if `max_price` was set)* raise the ceiling 50%: `search_listings(description, size, max_price * 1.5)`.
+     3. *(only if both were set and 1–2 still empty)* drop size AND raise the ceiling 50%:
+        `search_listings(description, None, max_price * 1.5)`.
+     - The first retry attempt that succeeds sets `session["search_results"]`,
+       `session["selected_item"] = search_results[0]`, and `session["relaxed"]` to a short string
+       describing what changed (e.g. `"dropped your size filter"`, `"raised your price ceiling to ~$45"`,
+       `"dropped your size filter and raised your price ceiling to ~$45"`). The loop then continues to
+       step 4 as normal.
+     - **If all attempts (original + retries) are empty** → set `session["error"]` to a message naming
+       what to loosen, leave `outfit_suggestion`/`fit_card`/`savings` as `None`, and **return early**.
+       suggest_outfit is never called.
+4. **Estimate savings (stretch).** Call `estimate_savings(selected_item)`; store in `session["savings"]`.
+5. **Suggest.** Call `suggest_outfit(selected_item, wardrobe)`; store in `session["outfit_suggestion"]`.
+6. **Fit card.** Call `create_fit_card(outfit_suggestion, selected_item, savings)`; store in
+   `session["fit_card"]`.
+7. **Return** the completed session.
 
-The loop "knows it's done" when it either hits the early-return error branch or finishes step 5 with all
-three session fields populated.
+The loop "knows it's done" when it either hits the early-return error branch or finishes step 6 with all
+session fields populated.
 
 ---
 
@@ -126,12 +163,15 @@ A single `session` dict (created by `_new_session`) is the one source of truth f
 created once at the top of `run_agent` and threaded through every step:
 
 - `query` / `parsed` — raw input and extracted `description`/`size`/`max_price`.
-- `search_results` — output of tool 1.
-- `selected_item` — `search_results[0]`; this exact dict is passed into BOTH `suggest_outfit` and
-  `create_fit_card`, so the item the user re-searches for never has to be re-entered.
+- `search_results` — output of tool 1 (from whichever attempt — original or a retry — first succeeded).
+- `relaxed` — `None` if the original search succeeded; otherwise a short string describing which
+  constraint(s) the retry loop dropped/loosened to find results.
+- `selected_item` — `search_results[0]`; this exact dict is passed into `estimate_savings`,
+  `suggest_outfit`, and `create_fit_card`, so the item the user re-searches for never has to be re-entered.
+- `savings` — output of tool 4 (`estimate_savings`); passed into `create_fit_card`.
 - `outfit_suggestion` — output of tool 2; passed directly into tool 3.
 - `fit_card` — output of tool 3.
-- `error` — set only on the early-return branch; `None` on success.
+- `error` — set only on the early-return branch (all search attempts empty); `None` on success.
 
 Each tool reads from the session and writes its result back before the next tool runs, so no value is
 re-derived or re-entered between steps. `app.py` reads the final session and maps three of its fields to
@@ -143,7 +183,8 @@ the three output panels.
 
 | Tool | Failure mode | Agent response |
 |------|-------------|----------------|
-| search_listings | No results match the query | Agent sets `session["error"]`: *"No listings matched 'X' under $Y in size Z. Try raising your price, dropping the size filter, or using broader keywords."* and stops — does not call the styling tools. |
+| search_listings | No results match the query | Agent retries with progressively looser constraints (drop size, then raise price ceiling 50%, then both — see Planning Loop). If a retry succeeds, `session["relaxed"]` explains what changed and the loop continues normally. If **all** attempts are empty, sets `session["error"]`: *"No listings matched 'X' under $Y in size Z. Try raising your price, dropping the size filter, or using broader keywords."* and stops — does not call the styling tools. |
+| estimate_savings | LLM/network error or unparsable response | Falls back to a heuristic (`estimated_retail = price * 2.5`) and computes `savings_amount`/`savings_pct` from that — never raises. |
 | suggest_outfit | Wardrobe is empty | Tool detects `wardrobe["items"] == []` and asks the LLM for general styling advice for the item (colors/silhouettes/vibe) instead of naming owned pieces; still returns a useful non-empty string. |
 | suggest_outfit | LLM/network error | Caught; returns a readable fallback string so the agent doesn't crash. |
 | create_fit_card | Outfit input is missing or incomplete | Returns the descriptive string *"Can't write a fit card without an outfit suggestion."* with no LLM call and no exception. |
@@ -156,36 +197,47 @@ the three output panels.
 User query + wardrobe choice
         │
         ▼
-┌──────────────────────────────────────────────────────────────┐
-│  run_agent()  — Planning Loop                                  │
-│                                                                │
+┌──────────────────────────────────────────────────────────────────┐
+│  run_agent()  — Planning Loop                                      │
+│                                                                    │
 │  parse query (regex) ──► session["parsed"] {description,size,max_price}
-│        │                                                       │
-│        ▼                                                       │
-│  search_listings(description, size, max_price)                 │
-│        │                                                       │
-│        ├── results == []  ──► session["error"] = "loosen..."   │
-│        │                      └───────────► RETURN early ──────┼──► (fit_card stays None)
-│        │                                                       │
-│        │ results == [item, ...]                                │
-│        ▼                                                       │
-│  session["selected_item"] = results[0]                         │
-│        │                                                       │
-│        ▼                                                       │
-│  suggest_outfit(selected_item, wardrobe)                       │
-│        │   (empty wardrobe ► general advice branch inside tool)│
-│        ▼                                                       │
-│  session["outfit_suggestion"] = "..."                          │
-│        │                                                       │
-│        ▼                                                       │
-│  create_fit_card(outfit_suggestion, selected_item)             │
-│        │   (empty outfit ► error-string branch inside tool)    │
-│        ▼                                                       │
-│  session["fit_card"] = "..."                                   │
-│        │                                                       │
-└────────┼───────────────────────────────────────────────────────┘
+│        │                                                           │
+│        ▼                                                           │
+│  search_listings(description, size, max_price)                     │
+│        │                                                           │
+│        ├── results == []  ──► retry: drop size ──► raise price 50% │
+│        │                          ──► drop size + raise price       │
+│        │                                                           │
+│        │     ├── all retries == [] ──► session["error"] = "loosen..."
+│        │     │                         └─► RETURN early (fit_card/savings stay None)
+│        │     │                                                     │
+│        │     └── a retry succeeds ──► session["relaxed"] = "dropped size..."
+│        │                                                           │
+│        │ results == [item, ...] (original or relaxed)              │
+│        ▼                                                           │
+│  session["selected_item"] = results[0]                             │
+│        │                                                           │
+│        ▼                                                           │
+│  estimate_savings(selected_item)                                    │
+│        │   (LLM error ► heuristic 2.5x fallback inside tool)       │
+│        ▼                                                           │
+│  session["savings"] = {estimated_retail, savings_amount, savings_pct}
+│        │                                                           │
+│        ▼                                                           │
+│  suggest_outfit(selected_item, wardrobe)                            │
+│        │   (empty wardrobe ► general advice branch inside tool)    │
+│        ▼                                                           │
+│  session["outfit_suggestion"] = "..."                              │
+│        │                                                           │
+│        ▼                                                           │
+│  create_fit_card(outfit_suggestion, selected_item, savings)        │
+│        │   (empty outfit ► error-string branch inside tool)        │
+│        ▼                                                           │
+│  session["fit_card"] = "..."                                       │
+│        │                                                           │
+└────────┼─────────────────────────────────────────────────────────┘
          ▼
-   return session  ──►  app.py maps fields to 3 output panels
+   return session  ──►  app.py maps fields to 3 output panels + relaxed notice
 ```
 
 State store = the `session` dict, read/written at every step above.
@@ -244,6 +296,14 @@ and the fit card caption.
 
 ## Stretch (update before starting)
 
-Candidate: **Retry with loosened constraints.** If `search_listings` returns `[]`, the loop retries once
-with `size=None` (and/or a higher `max_price`), and `session["error"]`/a notice tells the user what was
-relaxed. Will document the exact retry order here before implementing.
+**Implemented — Retry with loosened constraints.** If `search_listings` returns `[]`, the loop retries
+with progressively looser constraints in a fixed order (drop size → raise price ceiling 50% → drop size
+AND raise price 50%), stopping at the first non-empty result. `session["relaxed"]` is set to a short
+string describing what changed; `app.py` shows it as a small notice above the listing. If every attempt
+(original + all retries) is empty, the original error behavior is unchanged. See Planning Loop and
+Architecture above for the exact order and Error Handling for the failure-mode table.
+
+**Implemented — Tool 4: estimate_savings.** A new tool that estimates an item's retail price via the LLM
+and computes savings vs. its secondhand price (falling back to a 2.5x heuristic on LLM failure). Wired
+into the planning loop after `selected_item` is chosen; `session["savings"]` is passed into
+`create_fit_card` so the caption can mention the deal. See Tool 4 spec above.

@@ -33,15 +33,16 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
             (listing_text, outfit_suggestion, fit_card)
         Each string maps to one of the three output panels in the UI.
 
-    TODO:
+    Steps:
         1. Guard against an empty query (return early with an error message).
         2. Select the wardrobe based on wardrobe_choice.
         3. Call run_agent() with the query and selected wardrobe.
         4. If session["error"] is set, return the error in the first panel
            and empty strings for the other two.
         5. Otherwise, format session["selected_item"] into a readable listing_text
-           string and return it along with session["outfit_suggestion"] and
-           session["fit_card"].
+           string — prefixed with a notice if session["relaxed"] is set and
+           suffixed with savings info from session["savings"] — and return it
+           along with session["outfit_suggestion"] and session["fit_card"].
     """
     # 1. Guard against an empty query.
     if not user_query or not user_query.strip():
@@ -63,12 +64,25 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
     # 5. Happy path: format the selected listing and return all three fields.
     item = session["selected_item"]
     brand = item.get("brand") or "—"
-    listing_text = (
+
+    listing_text = ""
+    if session.get("relaxed"):
+        listing_text += f"(Couldn't find an exact match — {session['relaxed']}.)\n\n"
+
+    listing_text += (
         f"{item['title']}\n"
         f"${item['price']:.0f} · {item['platform']} · {item['condition']} condition\n"
         f"Size: {item.get('size', 'n/a')} · Brand: {brand}\n\n"
         f"{item['description']}"
     )
+
+    savings = session.get("savings")
+    if savings and savings.get("savings_amount", 0) > 0:
+        listing_text += (
+            f"\n\nEst. retail: ~${savings['estimated_retail']:.0f} · "
+            f"You save ~${savings['savings_amount']:.0f} ({savings['savings_pct']}% off)"
+        )
+
     return listing_text, session["outfit_suggestion"], session["fit_card"]
 
 

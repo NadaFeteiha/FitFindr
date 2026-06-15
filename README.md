@@ -37,10 +37,11 @@ LLM: Groq `llama-3.3-70b-versatile`.
 |------|--------|--------|---------|
 | `search_listings` | `description` (str), `size` (str \| None), `max_price` (float \| None) | `list[dict]` — matching listings sorted best-first (each dict: `id, title, description, category, style_tags, size, condition, price, colors, brand, platform`); `[]` if none match | Filter + rank the 40-item listings dataset against the user's request. |
 | `suggest_outfit` | `new_item` (dict — a listing), `wardrobe` (dict with an `items` list) | `str` — 1–2 outfit ideas (names owned pieces if the wardrobe is non-empty; general advice if empty) | Style the found item against what the user already owns. |
-| `create_fit_card` | `outfit` (str), `new_item` (dict — a listing) | `str` — a 2–4 sentence shareable caption (mentions item name, price, platform once each) | Turn the outfit into an OOTD-style social caption. |
+| `create_fit_card` | `outfit` (str), `new_item` (dict — a listing), `savings` (dict \| None) | `str` — a 2–4 sentence shareable caption (mentions item name, price, platform once each; mentions the deal if `savings` is given) | Turn the outfit into an OOTD-style social caption. |
+| `estimate_savings` | `item` (dict — a listing) | `dict` — `{estimated_retail, savings_amount, savings_pct}` | Estimate the item's retail price and how much the user saves buying it secondhand. |
 
-`search_listings` is pure Python; `suggest_outfit` and `create_fit_card` call the Groq LLM.
-Signatures match `tools.py` exactly.
+`search_listings` is pure Python; the other three call the Groq LLM (each with a non-LLM fallback if the
+call fails). Signatures match `tools.py` exactly.
 
 ## How the Planning Loop Works
 
@@ -50,18 +51,23 @@ Signatures match `tools.py` exactly.
 1. **Parse** the query with regex (`_parse_query`) into `description`, `size`, and `max_price`. Price comes
    from patterns like `under $30`; size from `size M` / `in a M`; the description is the query with those
    phrases stripped so they don't pollute the keyword match.
-2. **Search:** call `search_listings(description, size, max_price)`.
+2. **Search with retry (`_search_with_retries`):** call `search_listings(description, size, max_price)`.
+   If that's empty, retry with progressively looser constraints — drop size, then raise the price ceiling
+   50%, then both — stopping at the first non-empty result.
 3. **Branch — the decision point:**
-   - If the result list is **empty** → set `session["error"]` to a message naming exactly what to loosen
-     (price / size / keywords) and **return early**. `suggest_outfit` and `create_fit_card` are never called,
-     so `fit_card` stays `None`.
-   - If **non-empty** → set `selected_item = results[0]` and continue.
-4. **Suggest:** call `suggest_outfit(selected_item, wardrobe)`.
-5. **Fit card:** call `create_fit_card(outfit_suggestion, selected_item)`.
-6. **Return** the session.
+   - If **every** attempt is **empty** → set `session["error"]` to a message naming exactly what to loosen
+     (price / size / keywords) and **return early**. `estimate_savings`, `suggest_outfit`, and
+     `create_fit_card` are never called, so those fields stay `None`.
+   - If **any** attempt is **non-empty** → set `selected_item = results[0]`, set `session["relaxed"]` to a
+     note describing what was loosened (or `None` if the original query worked), and continue.
+4. **Estimate savings:** call `estimate_savings(selected_item)` → `session["savings"]`.
+5. **Suggest:** call `suggest_outfit(selected_item, wardrobe)`.
+6. **Fit card:** call `create_fit_card(outfit_suggestion, selected_item, savings)`.
+7. **Return** the session.
 
-So the agent's behavior genuinely differs by input: an impossible query stops after step 2 with an error;
-a good query runs all the way through to a fit card.
+So the agent's behavior genuinely differs by input: an impossible query stops after step 3 with an error;
+a query that's *almost* right gets quietly relaxed and noted; a good query runs all the way through to a
+fit card with a savings estimate.
 
 ## State Management
 
@@ -71,11 +77,12 @@ once at the top of `run_agent` and threaded through every step — nothing is re
 | Field | Set when | Used by |
 |-------|----------|---------|
 | `query`, `parsed` | start / step 1 | search |
-| `search_results` | step 2 | branch decision |
-| `selected_item` | step 4 (`= search_results[0]`) | **passed into both** `suggest_outfit` and `create_fit_card` |
+| `search_results`, `relaxed` | step 2 (after retries) | branch decision; `relaxed` shown to user as a notice |
+| `selected_item` | step 3 (`= search_results[0]`) | **passed into** `estimate_savings`, `suggest_outfit`, and `create_fit_card` |
+| `savings` | step 4 | passed into `create_fit_card`; shown to user |
 | `outfit_suggestion` | step 5 | passed into `create_fit_card` |
 | `fit_card` | step 6 | shown to user |
-| `error` | only on the early-return branch | shown to user; `None` on success |
+| `error` | only on the early-return branch (all attempts empty) | shown to user; `None` on success |
 
 The item found by `search_listings` flows into the styling tools automatically via `selected_item` — the
 user never re-types it. `app.py`'s `handle_query` reads the final session and maps three fields to the three UI panels.
@@ -84,7 +91,8 @@ user never re-types it. `app.py`'s `handle_query` reads the final session and ma
 
 | Tool | Failure mode | What the agent does |
 |------|--------------|---------------------|
-| `search_listings` | No listings match | Returns `[]` (never raises). The loop catches it and sets a specific message, e.g. *"No listings matched 'designer ballgown' in size XXS under $5. Try raising your price, dropping the size filter, or using broader keywords."* — then stops without calling the styling tools. |
+| `search_listings` | No listings match | Returns `[]` (never raises). The loop retries with looser constraints (drop size → raise price 50% → both). If a retry succeeds, `session["relaxed"]` notes what changed and the run continues normally. If **every** attempt is empty, sets a specific message, e.g. *"No listings matched 'designer ballgown' in size XXS under $5. Try raising your price, dropping the size filter, or using broader keywords."* — then stops without calling the styling tools. |
+| `estimate_savings` | LLM / network error or unparsable response | Falls back to `estimated_retail = price * 2.5` and computes savings from that — never raises. |
 | `suggest_outfit` | Wardrobe is empty | Detects `wardrobe["items"] == []` and asks the LLM for general styling advice (colors / silhouettes / vibe) instead of naming owned pieces. Still returns a useful non-empty string. |
 | `suggest_outfit` | LLM / network error | Wrapped in try/except; returns a readable fallback string so the agent stays usable. |
 | `create_fit_card` | Outfit string empty/whitespace | Returns `"Can't write a fit card without an outfit suggestion."` — no LLM call, no exception. |
@@ -117,6 +125,13 @@ with the loosening message above and leaves `fit_card = None` — verified via `
    empty-search result** (rather than calling all three tools unconditionally) and stores each result in the
    `session` dict; I also **added the `_parse_query` regex helper** for size/price extraction, which the loop
    spec referenced but didn't fully specify.
+3. **Stretch features.** I updated `planning.md` first with specs for (a) retrying a failed search with
+   progressively looser constraints and (b) a 4th tool, `estimate_savings`, then asked Claude to implement
+   both: `_search_with_retries` in `agent.py`, `estimate_savings` in `tools.py`, and wiring `session["relaxed"]`
+   / `session["savings"]` through to `create_fit_card` and the Gradio UI. I verified the retry order against
+   the spec with concrete dataset queries (e.g. a size-XL search that only succeeds after the size filter is
+   dropped) and confirmed `estimate_savings` falls back to the `price * 2.5` heuristic when `GROQ_API_KEY` is
+   unset, then added `tests/test_agent.py` and new `tests/test_tools.py` cases — all `pytest tests/` pass.
 
 ## Project Layout
 
@@ -124,9 +139,10 @@ with the loosening message above and leaves `fit_card = None` — verified via `
 fitfindr/
 ├── data/                  listings.json (40 listings) + wardrobe_schema.json
 ├── utils/data_loader.py   load_listings / get_example_wardrobe / get_empty_wardrobe
-├── tools.py               the 3 tools
-├── agent.py               run_agent planning loop + _parse_query
+├── tools.py               the 4 tools (incl. estimate_savings)
+├── agent.py               run_agent planning loop + _parse_query + _search_with_retries
 ├── app.py                 Gradio UI + handle_query
 ├── tests/test_tools.py    pytest tool tests
+├── tests/test_agent.py    pytest planning-loop tests
 └── planning.md            spec (written before implementation)
 ```
